@@ -1,0 +1,6 @@
+# Logs and backups the script writes to --logdir (default: the current
+# directory). Backups hold copies of .git/config files: never commit them.
+bitbucket-ssh-migrate-*.log
+bitbucket-ssh-migrate-*-backup.tar.gz
+
+.claude/
