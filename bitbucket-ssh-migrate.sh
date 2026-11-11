@@ -205,7 +205,8 @@ CHECK_ROWS=""      # name TAB status TAB detail, one per line
 FIX_TEXT=""        # numbered fixes printed under the table
 FIX_N=0
 FIX_REF=""
-HOSTKEY_STATE=unknown   # ok | missing | unknown
+HOSTKEY_STATE=unknown   # ok | missing | disabled | unknown
+HOSTKEY_STRICT=ask      # StrictHostKeyChecking in effect for ssh.bitbucket.org
 
 add_check() { CHECK_ROWS="$CHECK_ROWS$1"$'\t'"$2"$'\t'"$3"$'\n'; }
 
@@ -219,21 +220,82 @@ add_fix() {
   for line in "$@"; do FIX_TEXT="$FIX_TEXT         $line"$'\n'; done
 }
 
+# The value of setting $2 in `ssh -G` output $1 (everything after the name).
+ssh_value() {
+  printf '%s\n' "$1" | awk -v k="$2" '$1 == k { sub(/^[^ ]+ /, ""); print; exit }'
+}
+
+# Is ssh.bitbucket.org's host key trusted, and does ssh check it at all? Uses
+# the settings ssh really applies to that host (checking mode, known-hosts
+# files, HostKeyAlias, port), not just ~/.ssh/known_hosts.
 check_known_hosts() {
-  local name="host key (known_hosts)"
-  if ! command -v ssh-keygen >/dev/null 2>&1; then
-    add_check "$name" "??" "ssh-keygen not found; can't tell"
+  local name="host key (known_hosts)" cfg ufiles gfiles alias host port lookup
+  local f first="" found=0 nulls=1 off=0 lines=()
+  if ! command -v ssh >/dev/null 2>&1 || ! command -v ssh-keygen >/dev/null 2>&1; then
+    add_check "$name" "??" "ssh or ssh-keygen not found"
     return
   fi
-  if ssh-keygen -F ssh.bitbucket.org >/dev/null 2>&1; then
+  cfg=$(ssh -G ssh.bitbucket.org 2>/dev/null)
+  if [ -z "$cfg" ]; then
+    add_check "$name" "??" "ssh -G failed; check by hand"
+    return
+  fi
+  HOSTKEY_STRICT=$(ssh_value "$cfg" stricthostkeychecking)
+  ufiles=$(ssh_value "$cfg" userknownhostsfile)
+  gfiles=$(ssh_value "$cfg" globalknownhostsfile)
+  alias=$(ssh_value "$cfg" hostkeyalias)
+  host=${alias:-$(ssh_value "$cfg" hostname)}
+  port=$(ssh_value "$cfg" port)
+  # known_hosts names a non-standard port as [host]:port; an alias stands alone.
+  lookup=$host
+  if [ -z "$alias" ] && [ -n "$port" ] && [ "$port" != 22 ]; then lookup="[$host]:$port"; fi
+
+  [ -n "$ufiles" ] || nulls=0
+  # Word splitting is wanted: ssh -G lists the files separated by spaces.
+  for f in $ufiles; do
+    [ -n "$first" ] || first=$f
+    [ "$f" = /dev/null ] || nulls=0
+    if [ -f "$f" ] && ssh-keygen -F "$lookup" -f "$f" >/dev/null 2>&1; then found=1; fi
+  done
+  for f in $gfiles; do
+    if [ -f "$f" ] && ssh-keygen -F "$lookup" -f "$f" >/dev/null 2>&1; then found=1; fi
+  done
+  case $HOSTKEY_STRICT in false|no|off) off=1 ;; esac
+
+  if [ "$nulls" -eq 1 ] || [ "$off" -eq 1 ]; then
+    HOSTKEY_STATE=disabled
+    [ "$nulls" -eq 1 ] && lines+=("    UserKnownHostsFile /dev/null    (never remembers a key)")
+    [ "$off" -eq 1 ]   && lines+=("    StrictHostKeyChecking no        (accepts any key)")
+    add_fix "ssh doesn't verify ssh.bitbucket.org's host key. In effect:" \
+            "${lines[@]}" \
+            "Anyone on your network path could pose as Bitbucket. Find the lines:" \
+            "    ssh -v -G ssh.bitbucket.org 2>&1 | grep 'Applying options'" \
+            "and delete them (StrictHostKeyChecking accept-new skips prompts" \
+            "safely). Then run  ssh -T git@ssh.bitbucket.org  and check the key."
+    add_check "$name" "$FIX_REF" "host key checking is turned off"
+  elif [ "$found" -eq 1 ]; then
     HOSTKEY_STATE=ok
     add_check "$name" "OK" "ssh.bitbucket.org is known"
   else
     HOSTKEY_STATE=missing
-    add_fix "Run once in a terminal:  ssh -T git@ssh.bitbucket.org" \
-            "Accept the key only if its fingerprint matches" \
-            "https://bitbucket.org/site/ssh. Until you do, git in IDEs, GUI" \
-            "clients and scripts fails at the host-key prompt."
+    case $HOSTKEY_STRICT in
+      true|yes)
+        add_fix "Your ssh never adds host keys itself (StrictHostKeyChecking yes)." \
+                "Fetch the keys and check their fingerprints:" \
+                "    ssh-keyscan ssh.bitbucket.org > bb.keys && ssh-keygen -lf bb.keys" \
+                "If they match https://bitbucket.org/site/ssh, add them:" \
+                "    cat bb.keys >> $(shell_path "$first") && rm bb.keys" ;;
+      accept-new)
+        add_fix "Run once in a terminal:  ssh -T git@ssh.bitbucket.org" \
+                "Your ssh adds new keys without asking (accept-new), so check it" \
+                "afterwards:  ssh-keygen -lF ssh.bitbucket.org  should match" \
+                "https://bitbucket.org/site/ssh." ;;
+      *)
+        add_fix "Run once in a terminal:  ssh -T git@ssh.bitbucket.org" \
+                "Accept the key only if its fingerprint matches" \
+                "https://bitbucket.org/site/ssh. Until you do, git in IDEs, GUI" \
+                "clients and scripts fails at the host-key prompt." ;;
+    esac
     add_check "$name" "$FIX_REF" "ssh.bitbucket.org not trusted yet"
   fi
 }
@@ -766,17 +828,23 @@ main() {
   separator
   say "NEXT STEPS"
   case $HOSTKEY_STATE in
+    disabled)
+      say "  $step. Turn host-key checking back on for ssh.bitbucket.org (FIX 1)."
+      step=$((step + 1)) ;;
     missing)
-      say "  $step. Run  ssh -T git@ssh.bitbucket.org  once and check the fingerprint (FIX 1)."
+      case $HOSTKEY_STRICT in
+        true|yes) say "  $step. Add ssh.bitbucket.org's host key, after checking it (FIX 1)." ;;
+        *)        say "  $step. Run  ssh -T git@ssh.bitbucket.org  once and check the fingerprint (FIX 1)." ;;
+      esac
       step=$((step + 1)) ;;
     unknown)
       say "  $step. If you haven't yet, run  ssh -T git@ssh.bitbucket.org  once and check the"
       say "     fingerprint against https://bitbucket.org/site/ssh."
       step=$((step + 1)) ;;
   esac
-  # FIX 1 is the host key when it's missing; it has its own step above.
+  # FIX 1 is the host key when that check fails; it has its own step above.
   local from=1
-  [ "$HOSTKEY_STATE" = missing ] && from=2
+  case $HOSTKEY_STATE in missing|disabled) from=2 ;; esac
   if [ "$FIX_N" -ge "$from" ]; then
     if [ "$FIX_N" -eq "$from" ]; then r="FIX $from"; else r="FIX $from-$FIX_N"; fi
     say "  $step. Do the fixes under SSH & GIT SETUP ($r)."

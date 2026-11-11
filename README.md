@@ -33,7 +33,8 @@ What's affected:
 - Optionally rewrites old-host SSH URLs in files tracked by git: Puppetfiles,
   `.gitmodules`, CI config, deploy scripts, `package.json`, and so on.
 - Checks your SSH and git setup for things a URL rewrite can't fix:
-  - the new host key isn't in `known_hosts` yet
+  - the new host's key isn't trusted yet, or ssh doesn't check it at all
+    (`StrictHostKeyChecking no` or `UserKnownHostsFile /dev/null` in effect)
   - a `Host bitbucket.org` block gives the old name settings the new name won't get
   - an ssh alias uses `HostName bitbucket.org`
   - a global `url.insteadOf` rule rewrites to the old host
@@ -333,6 +334,12 @@ Caveats:
 - **`Host key verification failed`, or git hangs in an IDE:** you haven't
   trusted the new host yet. Run `ssh -T git@ssh.bitbucket.org` once in a
   terminal.
+- **"host key checking is turned off":** something in your ssh config sets
+  `StrictHostKeyChecking no` or `UserKnownHostsFile /dev/null` for this
+  host, so ssh accepts any server that claims to be Bitbucket. To see which
+  file and line, run `ssh -v -G ssh.bitbucket.org 2>&1 | grep 'Applying options'`.
+  Delete those settings. If you don't want prompts, use
+  `StrictHostKeyChecking accept-new`, which still refuses a key that changes.
 - **`Permission denied (publickey)` after switching:** a `Host bitbucket.org`
   block in `~/.ssh/config` probably sets your key, and it doesn't match the
   new name. The "ssh config (Host match)" check flags this. Add the new name
