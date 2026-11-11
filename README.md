@@ -90,10 +90,11 @@ Or copy `bitbucket-ssh-migrate.sh` anywhere and run `chmod +x` on it.
    ./bitbucket-ssh-migrate.sh --apply ~/projects
    ```
 
-4. **Optionally, fix tracked files too,** then review and commit them in
-   each repo:
+4. **Optionally, fix tracked files too.** Review every line the dry run
+   lists first, then apply, then review and commit in each repo:
 
    ```sh
+   ./bitbucket-ssh-migrate.sh --fix-files ~/projects
    ./bitbucket-ssh-migrate.sh --apply --fix-files ~/projects
    git -C ~/projects/my-service diff
    ```
@@ -116,8 +117,9 @@ Re-running is safe. Anything already on the new host is left alone.
 | `-h`, `--help` |                        | Show help                                                  |
 
 The dry run always lists old-host URLs in tracked files (tagged `file`),
-with or without `--fix-files`. `--fix-files` only decides whether `--apply`
-rewrites them.
+with or without `--fix-files`. `--fix-files` decides whether `--apply`
+rewrites them. Without it, the dry run shows up to 10 lines per repo; with
+it, every line `--apply --fix-files` would change.
 
 Tips:
 
@@ -321,6 +323,14 @@ Caveats:
 - **This machine only.** CI servers (Jenkins, Bamboo, Bitbucket Pipelines),
   deploy targets, and servers or VMs with their own clones need the same
   change made there.
+- **Every match is rewritten.** `--fix-files` can't tell a live reference
+  (a Puppetfile entry) from an example in a doc or a test fixture, and it
+  doesn't go by where a repo is hosted: a GitHub-hosted repo can still pull
+  modules from Bitbucket. The `--fix-files` dry run lists every line it will
+  change; read it before `--apply`.
+- **This tool's own repo** is the one exception: `--fix-files` leaves the
+  files of the repo it runs from alone, because its README mentions the old
+  host on purpose. Its remote URL is still updated.
 - **Tracked files only.** `--fix-files` looks at files tracked by git, not
   untracked or ignored files.
 - **Skipped directories:** the search skips `~/Library`, `~/.Trash`,
@@ -360,7 +370,9 @@ tests/run.sh test_NAME     # just one
 Each test builds throwaway repos in a temp dir, runs the real script on
 them, and checks the repos and files afterwards. They cover hostile file
 names under `--fix-files`, a scanned repo's `core.fsmonitor`, output piped
-into `head`, non-ASCII file names, and an exported `CDPATH` or `GIT_DIR`.
+into `head`, non-ASCII file names, an exported `CDPATH` or `GIT_DIR`, and
+what `--fix-files` rewrites (every line shown in the dry run, repos hosted
+elsewhere, never this tool's own repo or script).
 
 ## Disclaimer
 

@@ -123,6 +123,73 @@ test_an_exported_git_dir_does_not_change_which_repo_is_used() {
   [ "$(origin_of "$T/decoy")" = "$OLD:team/decoy.git" ] || fail "decoy (outside DIR) was changed"
 }
 
+# Where a repo is hosted says nothing about what its files point at: a
+# GitHub-hosted VM repo can pull Puppet modules from Bitbucket, and those
+# lines break at the cutover like any other. (Limiting --fix-files to repos
+# with a Bitbucket remote was tried, and missed 3 of 14 real repos.)
+test_fix_files_rewrites_a_repo_hosted_elsewhere() {
+  new_repo "$T/repos/vm" "git@github.com:team/vm.git"
+  printf "mod 'nfs', :git => '%s:team/puppet-nfs.git'\n" "$OLD" > "$T/repos/vm/Puppetfile"
+  commit_all "$T/repos/vm"
+  run_script --apply --fix-files "$T/repos" >/dev/null 2>&1
+  [ "$(cat "$T/repos/vm/Puppetfile")" = "mod 'nfs', :git => '$NEW:team/puppet-nfs.git'" ] ||
+    fail "file now holds: $(cat "$T/repos/vm/Puppetfile")"
+}
+
+# This tool's own repo mentions the old host on purpose (README examples).
+# --fix-files must leave its files alone, but its remote still migrates.
+test_fix_files_leaves_the_running_scripts_own_repo_alone() {
+  local tool="$T/repos/tool"
+  new_repo "$tool" "$OLD:team/tool.git"
+  cp "$SCRIPT" "$tool/bitbucket-ssh-migrate.sh"
+  printf 'e.g. %s:team/repo.git\n' "$OLD" > "$tool/README.md"
+  commit_all "$tool"
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  printf 'mod: %s:team/x.git\n' "$OLD" > "$T/repos/r/Puppetfile"
+  commit_all "$T/repos/r"
+  (cd "$T/cwd" && "$tool/bitbucket-ssh-migrate.sh" --apply --fix-files --logdir "$T/logs" "$T/repos" >/dev/null 2>&1)
+  [ "$(cat "$tool/README.md")" = "e.g. $OLD:team/repo.git" ] || fail "tool README: $(cat "$tool/README.md")"
+  [ "$(origin_of "$tool")" = "$NEW:team/tool.git" ] || fail "tool remote: $(origin_of "$tool")"
+  [ "$(cat "$T/repos/r/Puppetfile")" = "mod: $NEW:team/x.git" ] ||
+    fail "other repo's Puppetfile: $(cat "$T/repos/r/Puppetfile")"
+}
+
+# The dry run is the review step, so it must show every line --apply will
+# change, not the first 10.
+test_fix_files_dry_run_lists_every_line_it_would_change() {
+  local i
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    printf 'dep%s: %s:team/x%s.git\n' "$i" "$OLD" "$i"
+  done > "$T/repos/r/deps.txt"
+  commit_all "$T/repos/r"
+  n=$(run_script --fix-files "$T/repos" 2>&1 | grep -c -E '^  file +deps\.txt:[0-9]+ ')
+  [ "$n" -eq 12 ] || fail "dry run showed $n of 12 lines"
+}
+
+# A copy of this script kept in a Bitbucket repo (a team tools repo) must
+# survive --fix-files. Its own old-host strings, rewritten, would make the
+# old-host alias check always pass and the TIP's insteadOf rules do nothing.
+test_fix_files_leaves_a_copy_of_this_script_unchanged() {
+  new_repo "$T/repos/tools" "$OLD:team/tools.git"
+  cp "$SCRIPT" "$T/repos/tools/bitbucket-ssh-migrate.sh"
+  commit_all "$T/repos/tools"
+  run_script --apply --fix-files "$T/repos" >/dev/null 2>&1
+  cmp -s "$SCRIPT" "$T/repos/tools/bitbucket-ssh-migrate.sh" ||
+    fail "the copy was changed: $(git -C "$T/repos/tools" diff --stat | tail -n 1)"
+}
+
+# The alias check builds its probe URL from parts (see the test above); it
+# must still see a global insteadOf rule that sends the old host to the new.
+test_alias_check_sees_a_git_insteadof_rule() {
+  local out
+  printf '[url "%s:"]\n\tinsteadOf = %s:\n' "$NEW" "$OLD" > "$T/gitconfig"
+  new_repo "$T/repos/r"
+  out=$(GIT_CONFIG_GLOBAL="$T/gitconfig" run_script "$T/repos" 2>&1)
+  printf '%s\n' "$out" | grep -q 'old-host alias.*| OK .*git rule' ||
+    fail "check row: $(printf '%s\n' "$out" | grep '| old-host alias')"
+}
+
 # --- runner -------------------------------------------------------------------
 
 if [ $# -gt 0 ]; then

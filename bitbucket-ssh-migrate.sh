@@ -31,8 +31,10 @@
 #                and submodule.*.url in each repo's local git config.
 #   --fix-files  With --apply, also rewrites old-host SSH URLs inside files
 #                tracked by git (Puppetfile, .gitmodules, CI config, deploy
-#                scripts...). The dry run lists those lines either way.
-#                Never commits: review with `git diff`.
+#                scripts...). Every match, docs and examples included, except
+#                in the repo this script lives in. The dry run lists those
+#                lines either way (with --fix-files, every one). Never
+#                commits: review with `git diff`.
 #
 #   With --apply, every file about to change is first copied into a backup
 #   tarball. If the backup fails, nothing is changed. Every run, dry or not,
@@ -50,7 +52,7 @@
 # and perl for --fix-files. Works on macOS and Linux.
 
 PROG=${0##*/}
-VERSION=1.1.1
+VERSION=1.2.0
 ORIG_ARGS="$*"
 
 DEFAULT_DEPTH=7
@@ -76,7 +78,8 @@ changes nothing.
   --apply       Make the changes. Every file that will change is backed up
                 to a tarball first; if the backup fails, nothing is changed.
   --fix-files   Also rewrite old-host SSH URLs in files tracked by git
-                (Puppetfile, .gitmodules, CI config, scripts). Never commits.
+                (Puppetfile, .gitmodules, CI config, scripts). Rewrites every
+                match, docs included: review the dry run first. Never commits.
   --depth N     How many directory levels to search below each DIR
                 (default: $DEFAULT_DEPTH).
   --logdir DIR  Where the log and backup go (default: the current directory).
@@ -138,6 +141,10 @@ git() { command git -c core.fsmonitor=false -c core.quotePath=false "$@"; }
 # shellcheck disable=SC2046  # one variable name per word, by design
 unset CDPATH $(git rev-parse --local-env-vars)
 
+# The repo this script runs from, if any. Its README and tests mention the old
+# host on purpose, so --fix-files leaves its files alone.
+SELF_TOP=$(top=$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null) && cd "$top" && pwd -P)
+
 # The log and backup can contain repo URLs and file contents: keep them private.
 umask 077
 [ -n "$LOG_DIR" ] || die "--logdir needs a directory"
@@ -154,6 +161,12 @@ PLAN="$WORK/plan"   # one tab-separated change per line: KIND, repo, path, key
 : > "$PLAN"
 
 # --- URL patterns -------------------------------------------------------------
+
+# Old-host URLs in this script's own code are built from this, never written
+# out: written out, they'd match GREP_RE, and --fix-files run on a repo that
+# holds a copy of this script would rewrite them (the alias check would then
+# always pass, and the TIP's insteadOf rules would do nothing).
+OLD_HOST=bitbucket.org
 
 # Rewrite one git config URL. Handles scp-like URLs (user@host:path) and
 # ssh:// or git+ssh:// URLs. Everything else comes back unchanged: HTTPS URLs,
@@ -390,7 +403,7 @@ SHOW_TIP=0
 
 # shellcheck disable=SC2088  # "~/.ssh/config" is display text, not a path
 print_tip() {
-  cat <<'EOF'
+  cat <<EOF
   TIP    Optional safety net for repos and URLs this script can't reach
          (unscanned repos, untracked files, package-manager git URLs, old
          clone commands in docs). Add this to ~/.ssh/config, which covers
@@ -398,8 +411,8 @@ print_tip() {
              Host bitbucket.org
                  HostName ssh.bitbucket.org
          or, for git only, add these rules:
-             git config --global url."git@ssh.bitbucket.org:".insteadOf "git@bitbucket.org:"
-             git config --global url."ssh://git@ssh.bitbucket.org/".insteadOf "ssh://git@bitbucket.org/"
+             git config --global url."git@ssh.bitbucket.org:".insteadOf "git@$OLD_HOST:"
+             git config --global url."ssh://git@ssh.bitbucket.org/".insteadOf "ssh://git@$OLD_HOST/"
          It only helps this machine, and it hides old URLs in tracked files
          that still break on VMs and CI. Rewrite those anyway.
 EOF
@@ -412,7 +425,7 @@ check_old_host_alias() {
     ssh_ok=1
   fi
   # --get-url applies url.insteadOf rules and exits; it never connects.
-  case $(git ls-remote --get-url git@bitbucket.org:team/repo.git 2>/dev/null) in
+  case $(git ls-remote --get-url "git@$OLD_HOST:team/repo.git" 2>/dev/null) in
     git@ssh.bitbucket.org:*) git_ok=1 ;;
   esac
   if [ "$ssh_ok" -eq 1 ] && [ "$git_ok" -eq 1 ]; then
@@ -482,6 +495,7 @@ print_checks() {
 N_REPOS=0; N_SKIPPED=0; N_BLOCKS=0
 N_URL_REPOS=0; N_URLS=0
 N_FILE_REPOS=0; N_FILES=0; N_FILE_LINES=0
+N_OWN_FILES=0    # files in this tool's own repo: never rewritten
 N_ALTSSH=0
 SEEN_WT=$'\n'    # work trees already scanned
 SEEN_CFG=$'\n'   # git config files already scanned (worktrees share one)
@@ -511,6 +525,7 @@ repo_block() {
 scan_repo() {
   local dir g gitdir cfgfile cfg line key val new items="" hits files nlines nfiles
   local rel rest ln text u found shown=0 err extra="" has_url=0 has_alt=0
+  local own=0 max
 
   dir=$(cd "$1" 2>/dev/null && pwd -P) || return 0
   case $SEEN_WT in *$'\n'"$dir"$'\n'*) return 0 ;; esac
@@ -548,16 +563,24 @@ scan_repo() {
       ;;
   esac
 
+  [ -n "$SELF_TOP" ] && [ "$dir" = "$SELF_TOP" ] && own=1
   hits=$(git -C "$dir" grep -n -I -E -e "$GREP_RE" 2>/dev/null)
   if [ -n "$hits" ]; then
     files=$(git -C "$dir" grep -l -I -E -e "$GREP_RE" 2>/dev/null)
     nlines=$(count_lines "$hits")
     nfiles=$(count_lines "$files")
-    N_FILE_REPOS=$((N_FILE_REPOS + 1))
-    N_FILES=$((N_FILES + nfiles))
-    N_FILE_LINES=$((N_FILE_LINES + nlines))
+    max=$MAX_SHOW
+    if [ "$own" -eq 0 ]; then
+      N_FILE_REPOS=$((N_FILE_REPOS + 1))
+      N_FILES=$((N_FILES + nfiles))
+      N_FILE_LINES=$((N_FILE_LINES + nlines))
+      # The dry run is where these get reviewed: show all that will change.
+      [ "$FIX_FILES" -eq 1 ] && max=$nlines
+    else
+      N_OWN_FILES=$nfiles
+    fi
     while IFS= read -r line; do
-      [ "$shown" -lt "$MAX_SHOW" ] || break
+      [ "$shown" -lt "$max" ] || break
       rel=${line%%:*}
       rest=${line#*:}
       ln=${rest%%:*}
@@ -571,8 +594,10 @@ scan_repo() {
       [ "$found" -eq 1 ] || items="${items}file"$'\t'"$rel:$ln"$'\t'"$(fit "$(trim "$text")" 60)"$'\n'
       shown=$((shown + 1))
     done <<< "$hits"
-    if [ "$nlines" -gt "$MAX_SHOW" ]; then
-      extra="  ...   $((nlines - MAX_SHOW)) more line(s): git -C $(shell_path "$dir") grep -n bitbucket.org"
+    [ "$own" -eq 0 ] ||
+      items="${items}note"$'\t'"this tool's own repo: --fix-files leaves its files alone"$'\t'$'\n'
+    if [ "$nlines" -gt "$max" ]; then
+      extra="  ...   $((nlines - max)) more line(s): git -C $(shell_path "$dir") grep -n bitbucket.org"
     fi
   fi
 
@@ -584,7 +609,7 @@ scan_repo() {
         printf 'URL\t%s\t%s\t%s\n' "$dir" "$cfgfile" "$key"
       done >> "$PLAN"
   fi
-  if [ -n "$hits" ] && [ "$FIX_FILES" -eq 1 ]; then
+  if [ -n "$hits" ] && [ "$FIX_FILES" -eq 1 ] && [ "$own" -eq 0 ]; then
     while IFS= read -r rel; do
       printf 'FILE\t%s\t%s\t%s\n' "$dir" "$dir/$rel" "$rel" >> "$PLAN"
     done <<< "$files"
@@ -801,6 +826,8 @@ main() {
   else
     kv "Files left alone" "$N_FILES file(s), $N_FILE_LINES line(s), in $N_FILE_REPOS repo(s)"
   fi
+  [ "$N_OWN_FILES" -gt 0 ] &&
+    kv "This tool's repo" "$N_OWN_FILES file(s) that mention the old host on purpose; never rewritten"
   [ "$N_ALTSSH" -gt 0 ] && kv "Left alone" "$N_ALTSSH repo(s) on altssh.bitbucket.org"
   kv "Files to back up" "$n_backup"
 
