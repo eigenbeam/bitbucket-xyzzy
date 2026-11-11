@@ -112,8 +112,9 @@ Re-running is safe. Anything already on the new host is left alone.
 | `--logdir DIR` | `.` (current dir)      | Where the log and backup go                                |
 | `-h`, `--help` |                        | Show help                                                  |
 
-`--fix-files` without `--apply` adds the file edits to the dry run so you can
-see them first.
+The dry run always lists old-host URLs in tracked files (tagged `file`),
+with or without `--fix-files`. `--fix-files` only decides whether `--apply`
+rewrites them.
 
 Tips:
 

@@ -29,9 +29,10 @@
 #                changes nothing.
 #   --apply      Makes the changes: rewrites remote.*.url, remote.*.pushurl
 #                and submodule.*.url in each repo's local git config.
-#   --fix-files  Adds old-host SSH URLs inside files tracked by git
-#                (Puppetfile, .gitmodules, CI config, deploy scripts...) to
-#                the plan. Never commits: review with `git diff`.
+#   --fix-files  With --apply, also rewrites old-host SSH URLs inside files
+#                tracked by git (Puppetfile, .gitmodules, CI config, deploy
+#                scripts...). The dry run lists those lines either way.
+#                Never commits: review with `git diff`.
 #
 #   With --apply, every file about to change is first copied into a backup
 #   tarball. If the backup fails, nothing is changed. Every run, dry or not,
