@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # bitbucket-ssh-migrate.sh
+# SPDX-License-Identifier: MIT (see LICENSE). No warranty; YMMV.
 #
 # Finds git repos that reach Bitbucket Cloud over SSH using the old hostname
 # (bitbucket.org) and switches them to the new one (ssh.bitbucket.org).
