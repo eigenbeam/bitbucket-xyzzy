@@ -350,6 +350,18 @@ Caveats:
 - **Something went wrong after `--apply`:** restore from the backup (see
   above), then run the dry run again to see the plan.
 
+## Tests
+
+```sh
+tests/run.sh               # every test
+tests/run.sh test_NAME     # just one
+```
+
+Each test builds throwaway repos in a temp dir, runs the real script on
+them, and checks the repos and files afterwards. They cover hostile file
+names under `--fix-files`, a scanned repo's `core.fsmonitor`, output piped
+into `head`, non-ASCII file names, and an exported `CDPATH` or `GIT_DIR`.
+
 ## Disclaimer
 
 YMMV. This script is provided as is, with no warranty of any kind, express or

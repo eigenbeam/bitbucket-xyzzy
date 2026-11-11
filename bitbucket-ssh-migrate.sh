@@ -50,7 +50,7 @@
 # and perl for --fix-files. Works on macOS and Linux.
 
 PROG=${0##*/}
-VERSION=1.1.0
+VERSION=1.1.1
 ORIG_ARGS="$*"
 
 DEFAULT_DEPTH=7
@@ -125,6 +125,18 @@ done
 if [ "$FIX_FILES" -eq 1 ]; then
   command -v perl >/dev/null 2>&1 || die "--fix-files needs perl on PATH"
 fi
+
+# Every git call below goes through this. A scanned repo's own config could
+# set core.fsmonitor to a command, which git grep would run; command-line -c
+# overrides it. core.quotePath=false prints non-ASCII file names as they are,
+# not C-quoted, so the names git grep prints are paths that exist.
+git() { command git -c core.fsmonitor=false -c core.quotePath=false "$@"; }
+
+# Inherited settings that would point every repo lookup somewhere else:
+# GIT_DIR and friends override git -C, and CDPATH can turn "cd .git" into a
+# jump to another repo's .git.
+# shellcheck disable=SC2046  # one variable name per word, by design
+unset CDPATH $(git rev-parse --local-env-vars)
 
 # The log and backup can contain repo URLs and file contents: keep them private.
 umask 077
@@ -654,8 +666,10 @@ apply_file() {
   if [ "$before" -eq 0 ]; then
     ACT_STATUS=skip; ACT_NOTE="already updated"; N_SKIP=$((N_SKIP + 1)); return
   fi
+  # The file goes in on stdin: given as an argument, perl's 2-arg open would
+  # run a name ending in "|" as a command and strip trailing spaces from it.
   # Write through the original file so its permissions and inode stay put.
-  if perl -pe "$PERL_FIX" "$abs" > "$WORK/fix.tmp" && cat "$WORK/fix.tmp" > "$abs"; then
+  if perl -pe "$PERL_FIX" < "$abs" > "$WORK/fix.tmp" && cat "$WORK/fix.tmp" > "$abs"; then
     after=$(grep -c -E "$GREP_RE" "$abs" 2>/dev/null); after=${after:-0}
     case $EDITED_REPOS in *$'\n'"$repo"$'\n'*) ;; *) EDITED_REPOS="$EDITED_REPOS$repo"$'\n' ;; esac
     if [ "$after" -eq 0 ]; then
@@ -728,6 +742,9 @@ rerun_command() {
 
 main() {
   local r roots="" n_planned n_backup step=1 repo first=1
+  # If whatever reads the output quits early (head, or q in less), keep going:
+  # dying of SIGPIPE here would stop --apply partway through.
+  trap '' PIPE
 
   separator
   say "RUN"
@@ -869,5 +886,7 @@ main() {
   [ "$N_FAIL" -eq 0 ]
 }
 
-main 2>&1 | tee -a "$LOG"
+# tee ignores SIGPIPE too, so the log stays complete (BSD tee; GNU tee still
+# stops at the first failed write to the terminal side).
+main 2>&1 | (trap '' PIPE; exec tee -a "$LOG")
 exit "${PIPESTATUS[0]}"
