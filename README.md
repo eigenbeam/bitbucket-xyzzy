@@ -293,7 +293,7 @@ YMMV. This script is provided as is, with no warranty of any kind, express or
 implied, including fitness for any particular purpose (see [LICENSE](LICENSE)
 for the formal version). It edits git config and, if you ask, files in your
 repos. Run the dry run first, read the plan, and keep the backup. If something
-goes wrong anyway, take it up with the Galactic Empire.
+goes wrong anyway, take it up with the Jedi Council.
 
 ## License
 
