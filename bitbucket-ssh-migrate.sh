@@ -238,30 +238,52 @@ check_known_hosts() {
   fi
 }
 
+# The connection settings ssh resolves for host $1, whatever Host, Match and
+# Include rules produced them. ssh -G prints config and exits; it never
+# connects.
+ssh_settings() {
+  ssh -G "$1" 2>/dev/null |
+    grep -E '^(user|port|identityfile|identitiesonly|identityagent|certificatefile|proxycommand|proxyjump) ' |
+    sort -u
+}
+
+# Lines of $1 that aren't lines of $2.
+lines_not_in() {
+  [ -n "$1" ] || return 0
+  printf '%s\n' "$1" | grep -Fxv -f <(printf '%s\n' "$2")
+}
+
+# shellcheck disable=SC2088  # "~/.ssh/config" is display text, not a path
 check_ssh_host_settings() {
-  local name="ssh config (Host match)"
-  local keys='^(user|port|identityfile|identitiesonly|identityagent|certificatefile|proxycommand|proxyjump) '
-  local old new l lines=()
+  local name="ssh config (Host match)" base old new own missing l lines=()
   if ! command -v ssh >/dev/null 2>&1; then
     add_check "$name" "??" "ssh not found"
     return
   fi
-  # Settings ssh resolves for each host name, whatever Host/Match/Include
-  # rules produced them. ssh -G prints config only; it never connects.
-  old=$(ssh -G bitbucket.org 2>/dev/null | grep -E "$keys" | sort)
-  new=$(ssh -G ssh.bitbucket.org 2>/dev/null | grep -E "$keys" | sort)
-  if [ -z "$old" ]; then
+  # A name no Host line mentions gives the baseline: ssh's defaults plus
+  # Host * rules. Only what bitbucket.org gets beyond that was set for it,
+  # and only that can be lost when the host name changes.
+  base=$(ssh_settings bitbucket-ssh-migrate.invalid)
+  old=$(ssh_settings bitbucket.org)
+  new=$(ssh_settings ssh.bitbucket.org)
+  if [ -z "$old" ] || [ -z "$base" ]; then
     add_check "$name" "??" "ssh -G failed; check by hand"
-  elif [ "$old" != "$new" ]; then
+    return
+  fi
+  own=$(lines_not_in "$old" "$base")
+  missing=$(lines_not_in "$own" "$new")
+  if [ -z "$own" ]; then
+    add_check "$name" "OK" "nothing set just for bitbucket.org"
+  elif [ -z "$missing" ]; then
+    add_check "$name" "OK" "new host gets the same settings"
+  else
     while IFS= read -r l; do
       lines+=("    $l")
-    done < <(printf '%s\n' "$old" | grep -Fxv -f <(printf '%s\n' "$new"))
-    add_fix "Give ssh.bitbucket.org what bitbucket.org gets in ~/.ssh/config:" \
+    done <<< "$missing"
+    add_fix "~/.ssh/config sets these for bitbucket.org but not ssh.bitbucket.org:" \
             "${lines[@]}" \
             "e.g. change the Host line to:  Host bitbucket.org ssh.bitbucket.org"
-    add_check "$name" "$FIX_REF" "new host misses settings"
-  else
-    add_check "$name" "OK" "same settings as bitbucket.org"
+    add_check "$name" "$FIX_REF" "new host misses $(count_lines "$missing") setting(s)"
   fi
 }
 
