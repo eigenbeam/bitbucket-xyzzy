@@ -309,6 +309,50 @@ check_ssh_aliases() {
   fi
 }
 
+# Optional safety net: an ssh or git alias that sends the old host name to
+# the new one, for repos and URLs this script never sees. Suggested, never
+# added: it only helps this machine and it hides stale URLs in tracked files.
+SHOW_TIP=0
+
+# shellcheck disable=SC2088  # "~/.ssh/config" is display text, not a path
+print_tip() {
+  cat <<'EOF'
+  TIP    Optional safety net for repos and URLs this script can't reach
+         (unscanned repos, untracked files, package-manager git URLs, old
+         clone commands in docs). Add this to ~/.ssh/config, which covers
+         every URL form:
+             Host bitbucket.org
+                 HostName ssh.bitbucket.org
+         or, for git only, add these rules:
+             git config --global url."git@ssh.bitbucket.org:".insteadOf "git@bitbucket.org:"
+             git config --global url."ssh://git@ssh.bitbucket.org/".insteadOf "ssh://git@bitbucket.org/"
+         It only helps this machine, and it hides old URLs in tracked files
+         that still break on VMs and CI. Rewrite those anyway.
+EOF
+}
+
+check_old_host_alias() {
+  local name="old-host alias (optional)" ssh_ok=0 git_ok=0
+  if command -v ssh >/dev/null 2>&1 &&
+     [ "$(ssh -G bitbucket.org 2>/dev/null | awk '$1 == "hostname" { print $2 }')" = ssh.bitbucket.org ]; then
+    ssh_ok=1
+  fi
+  # --get-url applies url.insteadOf rules and exits; it never connects.
+  case $(git ls-remote --get-url git@bitbucket.org:team/repo.git 2>/dev/null) in
+    git@ssh.bitbucket.org:*) git_ok=1 ;;
+  esac
+  if [ "$ssh_ok" -eq 1 ] && [ "$git_ok" -eq 1 ]; then
+    add_check "$name" "OK" "ssh config and git rule in place"
+  elif [ "$ssh_ok" -eq 1 ]; then
+    add_check "$name" "OK" "ssh config sends it to the new host"
+  elif [ "$git_ok" -eq 1 ]; then
+    add_check "$name" "OK" "git rule sends it to the new host"
+  else
+    SHOW_TIP=1
+    add_check "$name" "TIP" "none set up; see TIP below"
+  fi
+}
+
 check_git_url_rules() {
   local name="git url.insteadOf rules" scope out line origin rest key base newbase n=0 lines=()
   for scope in --global --system; do
@@ -352,6 +396,10 @@ print_checks() {
   if [ "$FIX_N" -gt 0 ]; then
     say ""
     printf '%s' "$FIX_TEXT"
+  fi
+  if [ "$SHOW_TIP" -eq 1 ]; then
+    say ""
+    print_tip
   fi
 }
 
@@ -641,6 +689,7 @@ main() {
   check_ssh_host_settings
   check_ssh_aliases
   check_git_url_rules
+  check_old_host_alias
   print_checks
 
   for r in "${ROOTS[@]}"; do roots="$roots${roots:+, }$(tilde "$r")"; done
@@ -739,6 +788,10 @@ main() {
   fi
   if [ "$EDITED_REPOS" != $'\n' ]; then
     say "  $step. Review and commit the file edits (see RESULT)."
+    step=$((step + 1))
+  fi
+  if [ "$SHOW_TIP" -eq 1 ]; then
+    say "  $step. Optional: add the old-host alias under TIP as a safety net."
     step=$((step + 1))
   fi
   say "  $step. This only covers this machine. CI jobs, deploy targets, and servers or VMs"

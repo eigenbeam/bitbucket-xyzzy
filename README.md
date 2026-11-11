@@ -37,6 +37,8 @@ What's affected:
   - a `Host bitbucket.org` block gives the old name settings the new name won't get
   - an ssh alias uses `HostName bitbucket.org`
   - a global `url.insteadOf` rule rewrites to the old host
+- Suggests, but never adds, an optional ssh or git alias for the old host as
+  a safety net (see [Optional safety net](#optional-safety-net-alias-the-old-host)).
 - Dry run by default. `--apply` writes and verifies a backup tarball first,
   and changes nothing if the backup fails.
 - Logs every run, dry or not.
@@ -151,15 +153,28 @@ SSH & GIT SETUP (checked only, never changed)
   | Check                      | Status | Detail                               |
   +----------------------------+--------+--------------------------------------+
   | host key (known_hosts)     | FIX 1  | ssh.bitbucket.org not trusted yet    |
-  | ssh config (Host match)    | OK     | same settings as bitbucket.org       |
+  | ssh config (Host match)    | OK     | nothing set just for bitbucket.org   |
   | ssh config (aliases)       | OK     | none use HostName bitbucket.org      |
   | git url.insteadOf rules    | OK     | none point at the old host           |
+  | old-host alias (optional)  | TIP    | none set up; see TIP below           |
   +----------------------------+--------+--------------------------------------+
 
   FIX 1  Run once in a terminal:  ssh -T git@ssh.bitbucket.org
          Accept the key only if its fingerprint matches
          https://bitbucket.org/site/ssh. Until you do, git in IDEs, GUI
          clients and scripts fails at the host-key prompt.
+
+  TIP    Optional safety net for repos and URLs this script can't reach
+         (unscanned repos, untracked files, package-manager git URLs, old
+         clone commands in docs). Add this to ~/.ssh/config, which covers
+         every URL form:
+             Host bitbucket.org
+                 HostName ssh.bitbucket.org
+         or, for git only, add these rules:
+             git config --global url."git@ssh.bitbucket.org:".insteadOf "git@bitbucket.org:"
+             git config --global url."ssh://git@ssh.bitbucket.org/".insteadOf "ssh://git@bitbucket.org/"
+         It only helps this machine, and it hides old URLs in tracked files
+         that still break on VMs and CI. Rewrite those anyway.
 --------------------------------------------------------------------------------
 REPOSITORIES
   Searched          ~/projects (depth 7)
@@ -189,7 +204,8 @@ DRY RUN: nothing was changed
 NEXT STEPS
   1. Run  ssh -T git@ssh.bitbucket.org  once and check the fingerprint (FIX 1).
   2. Run the "To apply" command above.
-  3. This only covers this machine. CI jobs, deploy targets, and servers or VMs
+  3. Optional: add the old-host alias under TIP as a safety net.
+  4. This only covers this machine. CI jobs, deploy targets, and servers or VMs
      with their own clones need the same change.
 --------------------------------------------------------------------------------
 ```
@@ -243,6 +259,45 @@ Left alone:
 - **URLs already on `ssh.bitbucket.org`**
 - **`altssh.bitbucket.org`** (port 443): reported as `keep`, because the
   announcement doesn't say whether it changes.
+
+## Optional safety net: alias the old host
+
+Rewriting remotes fixes the repos the script finds. An alias also catches
+what it can't reach:
+
+- repos it didn't scan
+- URLs in untracked files
+- git URLs that package managers fetch
+- old `git clone` commands in docs
+
+When no alias is set up, the script suggests one in a `TIP` row. It never
+adds one itself.
+
+The ssh form covers every URL form, and it keeps any settings already on a
+`Host bitbucket.org` block. Add to `~/.ssh/config`:
+
+```
+Host bitbucket.org
+    HostName ssh.bitbucket.org
+```
+
+Or, for git only:
+
+```sh
+git config --global url."git@ssh.bitbucket.org:".insteadOf "git@bitbucket.org:"
+git config --global url."ssh://git@ssh.bitbucket.org/".insteadOf "ssh://git@bitbucket.org/"
+```
+
+Caveats:
+
+- **This machine only.** VMs, CI and deploy targets still need their URLs
+  fixed.
+- **It hides stale URLs.** A Puppetfile or deploy script that still says
+  `bitbucket.org` keeps working on your laptop and fails where it actually
+  runs. Rewrite tracked files anyway (`--fix-files`).
+- **Some GUI clients may not honor it.** Clients that bundle their own git or
+  SSH implementation may skip `~/.ssh/config` or `url.insteadOf`. Setting up
+  both forms covers more of them.
 
 ## Backups, logs and undo
 
