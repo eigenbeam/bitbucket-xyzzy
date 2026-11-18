@@ -42,6 +42,8 @@ What's affected:
   a safety net (see [Optional safety net](#optional-safety-net-alias-the-old-host)).
 - Dry run by default. `--apply` writes and verifies a backup tarball first,
   and changes nothing if the backup fails.
+- `--undo BACKUP` reverts an `--apply` run, but only what's still the way
+  that run left it, so later changes to the same files survive.
 - Logs every run, dry or not.
 - Runs on the bash that ships with macOS (3.2). No dependencies to install.
 
@@ -49,7 +51,7 @@ What's affected:
 
 - bash 3.2 or later
 - git, find, sed, grep, tar
-- perl (only for `--fix-files`)
+- perl (only for `--fix-files` and `--undo`), cmp (only for `--undo`)
 - ssh and ssh-keygen (only for the setup checks)
 
 Tested on macOS. It sticks to options that are the same in BSD and GNU tools,
@@ -105,6 +107,7 @@ Re-running is safe. Anything already on the new host is left alone.
 
 ```
 ./bitbucket-ssh-migrate.sh [--apply] [--fix-files] [--depth N] [--logdir DIR] [DIR ...]
+./bitbucket-ssh-migrate.sh --undo BACKUP [--apply] [--logdir DIR]
 ```
 
 | Option         | Default                | Meaning                                                    |
@@ -114,6 +117,7 @@ Re-running is safe. Anything already on the new host is left alone.
 | `--fix-files`  | off                    | Also rewrite old-host URLs in files tracked by git; never commits |
 | `--depth N`    | `7`                    | How many directory levels to search below each DIR         |
 | `--logdir DIR` | `.` (current dir)      | Where the log and backup go                                |
+| `--undo BACKUP`|                        | Revert the `--apply` run that wrote BACKUP (see [undo](#backups-logs-and-undo)); dry run unless `--apply` is given too |
 | `-h`, `--help` |                        | Show help                                                  |
 
 The dry run always lists old-host URLs in tracked files (tagged `file`),
@@ -135,7 +139,7 @@ Tips:
 | Code | Meaning                                             |
 |------|-----------------------------------------------------|
 | 0    | Success, including a dry run that found changes     |
-| 1    | `--apply` hit a failure, or the backup failed (then nothing was changed) |
+| 1    | `--apply` hit a failure, or the backup failed (then nothing was changed), or `--undo` couldn't read the backup or hit a failure |
 | 2    | Bad arguments, a missing tool, or an unusable log dir |
 
 ## Example output
@@ -230,7 +234,7 @@ RESULT
   URLs updated      2
   Files rewritten   1
   Backup            ~/bitbucket-ssh-migrate-20261111-111250-backup.tar.gz
-  Undo              tar -xzf ~/bitbucket-ssh-migrate-20261111-111250-backup.tar.gz -C /
+  Undo              ./bitbucket-ssh-migrate.sh --undo ~/bitbucket-ssh-migrate-20261111-111250-backup.tar.gz
   Log               ~/bitbucket-ssh-migrate-20261111-111250.log
   Review, commit    git -C ~/projects/my-service diff
 --------------------------------------------------------------------------------
@@ -311,12 +315,25 @@ Caveats:
   of what it printed.
 - **Privacy:** the log and backup are readable only by you. The backup holds
   copies of `.git/config` files, so don't commit it or share it.
-- **Undo a run:** restore every file it changed to its state just before that
-  run:
+- **Undo a run:** see what undo would put back, then do it:
 
   ```sh
-  tar -xzf bitbucket-ssh-migrate-<timestamp>-backup.tar.gz -C /
+  ./bitbucket-ssh-migrate.sh --undo bitbucket-ssh-migrate-<timestamp>-backup.tar.gz
+  ./bitbucket-ssh-migrate.sh --undo bitbucket-ssh-migrate-<timestamp>-backup.tar.gz --apply
   ```
+
+  It reverts each URL the run changed if it still has the value the run
+  gave it, and puts back each file the run rewrote if the file is still
+  exactly what the run left. A URL or file changed since is left alone and
+  marked `skip`. The rest of each `.git/config` (branches, remotes, settings
+  added since) is never touched. It undoes the whole backup; it doesn't take
+  a `DIR`.
+- **Don't extract the backup over `/`** (`tar -xzf <backup> -C /`) to undo.
+  That replaces whole files, so it also throws away every later change to
+  them, such as the upstream of each branch created since. Without `-C /` it
+  "restores" into a copy under the current directory and changes nothing.
+  To look at one backed-up file, print it: `tar -xzOf <backup> PATH`, where
+  PATH is the file's full path without the leading `/`.
 
 ## Limitations
 
@@ -357,8 +374,11 @@ Caveats:
 - **A repo is marked `SKIP`:** git couldn't read it. Common causes are a
   worktree whose main repo was deleted, or a repo owned by another user. The
   line shows git's error.
-- **Something went wrong after `--apply`:** restore from the backup (see
+- **Something went wrong after `--apply`:** undo it with `--undo` (see
   above), then run the dry run again to see the plan.
+- **`--undo` marks something `skip` (changed since --apply):** it was changed
+  after the run, so undo leaves it to you. Compare it with the backup's copy
+  (`tar -xzOf <backup> PATH`) and edit it by hand.
 
 ## Tests
 
@@ -372,7 +392,8 @@ them, and checks the repos and files afterwards. They cover hostile file
 names under `--fix-files`, a scanned repo's `core.fsmonitor`, output piped
 into `head`, non-ASCII file names, an exported `CDPATH` or `GIT_DIR`, and
 what `--fix-files` rewrites (every line shown in the dry run, repos hosted
-elsewhere, never this tool's own repo or script).
+elsewhere, never this tool's own repo or script), and what `--undo` puts
+back and what it leaves alone.
 
 ## Disclaimer
 

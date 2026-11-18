@@ -190,6 +190,138 @@ test_alias_check_sees_a_git_insteadof_rule() {
     fail "check row: $(printf '%s\n' "$out" | grep '| old-host alias')"
 }
 
+# --- undo ---------------------------------------------------------------------
+# Restoring whole files from the backup (tar -xzf ... -C /) also throws away
+# everything changed in them since --apply. --undo reverts only what --apply
+# changed, and only where it's still the way --apply left it.
+
+# The backup tarball the --apply run in this test wrote.
+backup_file() { set -- "$T"/logs/*-backup.tar.gz; printf '%s' "$1"; }
+
+test_undo_reverts_a_remote_url() {
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  run_script --apply "$T/repos" >/dev/null 2>&1
+  run_script --undo "$(backup_file)" --apply >/dev/null 2>&1
+  [ "$(origin_of "$T/repos/r")" = "$OLD:team/r.git" ] || fail "origin: $(origin_of "$T/repos/r")"
+}
+
+test_undo_dry_run_changes_nothing() {
+  local out
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  run_script --apply "$T/repos" >/dev/null 2>&1
+  out=$(run_script --undo "$(backup_file)" 2>&1)
+  [ "$(origin_of "$T/repos/r")" = "$NEW:team/r.git" ] || fail "origin: $(origin_of "$T/repos/r")"
+  printf '%s\n' "$out" | grep -q -E '\] +undo +url ' || fail "the dry run doesn't list the url"
+}
+
+# Git writes to .git/config all the time (new branches, remotes, settings).
+test_undo_keeps_config_changes_made_after_apply() {
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  run_script --apply "$T/repos" >/dev/null 2>&1
+  git -C "$T/repos/r" config branch.main.remote origin
+  git -C "$T/repos/r" remote add fork "git@github.com:me/r.git"
+  run_script --undo "$(backup_file)" --apply >/dev/null 2>&1
+  [ "$(origin_of "$T/repos/r")" = "$OLD:team/r.git" ] || fail "origin: $(origin_of "$T/repos/r")"
+  [ "$(git -C "$T/repos/r" config branch.main.remote)" = origin ] || fail "branch.main.remote is gone"
+  [ "$(git -C "$T/repos/r" config remote.fork.url)" = "git@github.com:me/r.git" ] ||
+    fail "remote.fork.url is gone"
+}
+
+test_undo_leaves_a_url_changed_since_apply_alone() {
+  local out
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  run_script --apply "$T/repos" >/dev/null 2>&1
+  git -C "$T/repos/r" remote set-url origin "git@github.com:team/r.git"
+  out=$(run_script --undo "$(backup_file)" --apply 2>&1)
+  [ "$(origin_of "$T/repos/r")" = "git@github.com:team/r.git" ] || fail "origin: $(origin_of "$T/repos/r")"
+  printf '%s\n' "$out" | grep -q 'changed since' || fail "the output doesn't say why it was skipped"
+}
+
+test_undo_reverts_every_value_of_a_multi_valued_key() {
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  git -C "$T/repos/r" remote set-url --add --push origin "$OLD:team/a.git"
+  git -C "$T/repos/r" remote set-url --add --push origin "$OLD:team/b.git"
+  run_script --apply "$T/repos" >/dev/null 2>&1
+  run_script --undo "$(backup_file)" --apply >/dev/null 2>&1
+  [ "$(git -C "$T/repos/r" config --get-all remote.origin.pushurl | tr '\n' ' ')" = "$OLD:team/a.git $OLD:team/b.git " ] ||
+    fail "pushurl: $(git -C "$T/repos/r" config --get-all remote.origin.pushurl | tr '\n' ' ')"
+}
+
+# A submodule's config lives in the parent's .git/modules/NAME, not in a .git
+# directory of its own.
+test_undo_reverts_a_url_in_a_separate_git_dir() {
+  new_repo "$T/repos/super"
+  mkdir -p "$T/repos/super/.git/modules"
+  git init -q --separate-git-dir "$T/repos/super/.git/modules/sub" "$T/repos/super/sub"
+  git -C "$T/repos/super/sub" remote add origin "$OLD:team/sub.git"
+  run_script --apply "$T/repos" >/dev/null 2>&1
+  [ "$(origin_of "$T/repos/super/sub")" = "$NEW:team/sub.git" ] || fail "--apply didn't rewrite it"
+  run_script --undo "$(backup_file)" --apply >/dev/null 2>&1
+  [ "$(origin_of "$T/repos/super/sub")" = "$OLD:team/sub.git" ] ||
+    fail "origin: $(origin_of "$T/repos/super/sub")"
+}
+
+test_undo_reverts_a_rewritten_file() {
+  local out
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  printf "mod 'nfs', :git => '%s:team/nfs.git'\nmod 'stdlib'\n" "$OLD" > "$T/repos/r/Puppetfile"
+  commit_all "$T/repos/r"
+  cp "$T/repos/r/Puppetfile" "$T/original"
+  run_script --apply --fix-files "$T/repos" >/dev/null 2>&1
+  out=$(run_script --undo "$(backup_file)" --apply 2>&1)
+  cmp -s "$T/original" "$T/repos/r/Puppetfile" || fail "file now holds: $(cat "$T/repos/r/Puppetfile")"
+  printf '%s\n' "$out" | grep -q -E '\] +ok +file +[^ ]*/repos/r +Puppetfile' ||
+    fail "change line: $(printf '%s\n' "$out" | grep -E '\] +[a-zA-Z]+ +file ')"
+  printf '%s\n' "$out" | grep -q -E 'Review +git -C [^ ]*/repos/r diff' ||
+    fail "review line: $(printf '%s\n' "$out" | grep 'Review')"
+}
+
+test_undo_keeps_a_file_edited_after_apply() {
+  local out
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  printf "mod 'nfs', :git => '%s:team/nfs.git'\n" "$OLD" > "$T/repos/r/Puppetfile"
+  commit_all "$T/repos/r"
+  run_script --apply --fix-files "$T/repos" >/dev/null 2>&1
+  printf "mod 'added-later'\n" >> "$T/repos/r/Puppetfile"
+  cp "$T/repos/r/Puppetfile" "$T/edited"
+  out=$(run_script --undo "$(backup_file)" --apply 2>&1)
+  cmp -s "$T/edited" "$T/repos/r/Puppetfile" || fail "file now holds: $(cat "$T/repos/r/Puppetfile")"
+  printf '%s\n' "$out" | grep -q 'changed since' || fail "the output doesn't say why it was skipped"
+}
+
+test_undo_handles_a_non_ascii_file_name() {
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  printf '%s:team/x.git\n' "$OLD" > "$T/repos/r/résumé.md"
+  commit_all "$T/repos/r"
+  run_script --apply --fix-files "$T/repos" >/dev/null 2>&1
+  run_script --undo "$(backup_file)" --apply >/dev/null 2>&1
+  [ "$(cat "$T/repos/r/résumé.md")" = "$OLD:team/x.git" ] ||
+    fail "file now holds: $(cat "$T/repos/r/résumé.md")"
+}
+
+# A relative backup path must not be looked up through CDPATH.
+test_undo_finds_a_relative_backup_despite_an_exported_cdpath() {
+  local b
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  run_script --apply "$T/repos" >/dev/null 2>&1
+  b=$(backup_file)
+  mkdir -p "$T/decoy/logs"
+  (cd "$T" &&
+    CDPATH="$T/decoy" "$SCRIPT" --undo "logs/${b##*/}" --apply --logdir "$T/logs" >/dev/null 2>&1)
+  [ "$(origin_of "$T/repos/r")" = "$OLD:team/r.git" ] || fail "origin: $(origin_of "$T/repos/r")"
+}
+
+# "--undo BACKUP ~/projects/one-repo" reads like a narrower undo; it isn't one.
+test_undo_refuses_a_dir_argument() {
+  local rc
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  run_script --apply "$T/repos" >/dev/null 2>&1
+  run_script --undo "$(backup_file)" --apply "$T/repos" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 2 ] || fail "exit code $rc, not 2"
+  [ "$(origin_of "$T/repos/r")" = "$NEW:team/r.git" ] || fail "origin: $(origin_of "$T/repos/r")"
+}
+
 # --- runner -------------------------------------------------------------------
 
 if [ $# -gt 0 ]; then
@@ -201,6 +333,10 @@ fi
 
 passed=0; failed=0
 for t in "${TESTS[@]}"; do
+  if ! declare -F "$t" >/dev/null; then
+    printf 'FAIL  %s (no such test)\n' "$t"; failed=$((failed + 1))
+    continue
+  fi
   if (
     T=$(mktemp -d "${TMPDIR:-/tmp}/bbssh-test.XXXXXX") || exit 1
     trap 'rm -rf "$T"' EXIT

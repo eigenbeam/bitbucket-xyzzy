@@ -35,11 +35,15 @@
 #                in the repo this script lives in. The dry run lists those
 #                lines either way (with --fix-files, every one). Never
 #                commits: review with `git diff`.
+#   --undo BACKUP
+#                Puts back what the --apply run that wrote BACKUP changed,
+#                wherever it's still as that run left it. Anything changed
+#                since (a URL set by hand, an edited file) is left alone and
+#                reported. A dry run unless --apply is given too.
 #
 #   With --apply, every file about to change is first copied into a backup
 #   tarball. If the backup fails, nothing is changed. Every run, dry or not,
 #   writes a log. Both go in --logdir DIR (default: the current directory).
-#   Undo an --apply run with:  tar -xzf <backup>.tar.gz -C /
 #
 #   It never edits ~/.ssh/* or your global git config. It reports what to
 #   change there.
@@ -52,13 +56,15 @@
 # and perl for --fix-files. Works on macOS and Linux.
 
 PROG=${0##*/}
-VERSION=1.2.0
+VERSION=1.3.0
 ORIG_ARGS="$*"
 
 DEFAULT_DEPTH=7
 DEPTH=$DEFAULT_DEPTH
+DEPTH_SET=0
 APPLY=0
 FIX_FILES=0
+UNDO=""          # backup tarball whose --apply run to undo
 LOG_DIR=.
 LOG_DIR_SET=0
 ROOTS=()
@@ -68,6 +74,7 @@ die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
 usage() {
   cat <<EOF
 Usage: $PROG [--apply] [--fix-files] [--depth N] [--logdir DIR] [DIR ...]
+       $PROG --undo BACKUP [--apply] [--logdir DIR]
 
 Find git repos that use Bitbucket Cloud's old SSH hostname (bitbucket.org)
 and switch them to ssh.bitbucket.org.
@@ -83,6 +90,9 @@ changes nothing.
   --depth N     How many directory levels to search below each DIR
                 (default: $DEFAULT_DEPTH).
   --logdir DIR  Where the log and backup go (default: the current directory).
+  --undo BACKUP Put back what the --apply run that wrote BACKUP changed,
+                except where it has changed since. A dry run unless --apply
+                is given too.
   -h, --help    Show this help.
 
 DIR defaults to your home directory. On macOS, scanning all of it can
@@ -98,8 +108,7 @@ Examples:
   $PROG ~/projects                       # dry run
   $PROG --apply ~/projects               # update remote URLs
   $PROG --apply --fix-files ~/projects   # ...and tracked files too
-
-Undo an --apply run:  tar -xzf <backup>.tar.gz -C /
+  $PROG --undo <backup>.tar.gz           # what undo would put back
 EOF
 }
 
@@ -107,8 +116,10 @@ while [ $# -gt 0 ]; do
   case $1 in
     --apply)     APPLY=1 ;;
     --fix-files) FIX_FILES=1 ;;
-    --depth)     [ $# -ge 2 ] || die "--depth needs a number"; DEPTH=$2; shift ;;
-    --depth=*)   DEPTH=${1#*=} ;;
+    --depth)     [ $# -ge 2 ] || die "--depth needs a number"; DEPTH=$2; DEPTH_SET=1; shift ;;
+    --depth=*)   DEPTH=${1#*=}; DEPTH_SET=1 ;;
+    --undo)      [ $# -ge 2 ] || die "--undo needs a backup file"; UNDO=$2; shift ;;
+    --undo=*)    UNDO=${1#*=} ;;
     --logdir)    [ $# -ge 2 ] || die "--logdir needs a directory"; LOG_DIR=$2; LOG_DIR_SET=1; shift ;;
     --logdir=*)  LOG_DIR=${1#*=}; LOG_DIR_SET=1 ;;
     -h|--help)   usage; exit 0 ;;
@@ -120,13 +131,23 @@ while [ $# -gt 0 ]; do
 done
 
 case $DEPTH in ''|*[!0-9]*) die "--depth must be a number" ;; esac
+if [ -n "$UNDO" ]; then
+  # It undoes what the backup's run changed, wherever that was; none of the
+  # scan options apply.
+  [ "$FIX_FILES" -eq 0 ] && [ "$DEPTH_SET" -eq 0 ] && [ ${#ROOTS[@]} -eq 0 ] ||
+    die "--undo takes only --apply and --logdir (it undoes the whole backup)"
+  [ -f "$UNDO" ] || die "can't find the backup $UNDO"
+fi
 [ ${#ROOTS[@]} -gt 0 ] || ROOTS=("$HOME")
 
 for tool in git find sed grep tar; do
   command -v "$tool" >/dev/null 2>&1 || die "needs $tool on PATH"
 done
-if [ "$FIX_FILES" -eq 1 ]; then
-  command -v perl >/dev/null 2>&1 || die "--fix-files needs perl on PATH"
+if [ "$FIX_FILES" -eq 1 ] || [ -n "$UNDO" ]; then
+  command -v perl >/dev/null 2>&1 || die "--fix-files and --undo need perl on PATH"
+fi
+if [ -n "$UNDO" ]; then
+  command -v cmp >/dev/null 2>&1 || die "--undo needs cmp on PATH"
 fi
 
 # Every git call below goes through this. A scanned repo's own config could
@@ -140,6 +161,9 @@ git() { command git -c core.fsmonitor=false -c core.quotePath=false "$@"; }
 # jump to another repo's .git.
 # shellcheck disable=SC2046  # one variable name per word, by design
 unset CDPATH $(git rev-parse --local-env-vars)
+
+# Made absolute (now that CDPATH is gone) so the rerun command works anywhere.
+[ -z "$UNDO" ] || UNDO=$(cd "$(dirname "$UNDO")" && pwd)/${UNDO##*/}
 
 # The repo this script runs from, if any. Its README and tests mention the old
 # host on purpose, so --fix-files leaves its files alone.
@@ -167,6 +191,9 @@ PLAN="$WORK/plan"   # one tab-separated change per line: KIND, repo, path, key
 # holds a copy of this script would rewrite them (the alias check would then
 # always pass, and the TIP's insteadOf rules would do nothing).
 OLD_HOST=bitbucket.org
+
+# The git config keys that hold remote URLs.
+URL_KEYS='^(remote\..+\.(url|pushurl)|submodule\..+\.url)$'
 
 # Rewrite one git config URL. Handles scp-like URLs (user@host:path) and
 # ssh:// or git+ssh:// URLs. Everything else comes back unchanged: HTTPS URLs,
@@ -545,7 +572,7 @@ scan_repo() {
     *$'\n'"$cfgfile"$'\n'*) ;;
     *)
       SEEN_CFG="$SEEN_CFG$cfgfile"$'\n'
-      cfg=$(git -C "$dir" config --local --get-regexp '^(remote\..+\.(url|pushurl)|submodule\..+\.url)$' 2>/dev/null)
+      cfg=$(git -C "$dir" config --local --get-regexp "$URL_KEYS" 2>/dev/null)
       while IFS= read -r line; do
         [ -n "$line" ] || continue
         key=${line%% *}
@@ -753,6 +780,198 @@ backup_and_apply() {
   done 3< "$PLAN"
 }
 
+# --- undo ---------------------------------------------------------------------
+#
+# --undo BACKUP puts back what one --apply run changed, using that run's
+# backup, but only where things are still the way the run left them. Anything
+# changed since is left alone and reported. (Extracting the whole backup over /
+# would also throw away every later change to those files: new branches and
+# remotes in .git/config, edits to tracked files.)
+
+N_UNDO=0; N_CHANGED=0
+
+undo_skip() { ACT_STATUS=skip; ACT_NOTE=$1; N_SKIP=$((N_SKIP + 1)); }
+
+# rewrite_all VALUES: rewrite_url on each line.
+rewrite_all() { local v; while IFS= read -r v; do rewrite_url "$v"; done <<< "$1"; }
+
+# Is $1 the config file of a git directory (.git, or a submodule's
+# .git/modules/NAME)? Those get undone key by key; other files as a whole.
+is_git_config() {
+  [ "${1##*/}" = config ] && git rev-parse --resolve-git-dir "${1%/*}" >/dev/null 2>&1
+}
+
+# undo_steps: what the unpacked backup in $WORK/orig can undo, one step per
+# line: KIND TAB path TAB repo TAB name to show TAB key. Each file in the
+# backup belongs at the same path under /. The key, empty for files, goes
+# last: read splits on tabs as whitespace, so an empty field anywhere else
+# would vanish and shift the rest.
+undo_steps() {
+  local orig path line key old repo
+  while IFS= read -r -d '' orig; do
+    path=/${orig#"$WORK/orig/"}
+    if is_git_config "$path"; then
+      repo=${path%/config}
+      repo=${repo%/.git}
+      git config --file "$orig" --get-regexp "$URL_KEYS" 2>/dev/null |
+        while IFS= read -r line; do printf '%s\n' "${line%% *}"; done | sort -u |
+        while IFS= read -r key; do
+          old=$(git config --file "$orig" --get-all "$key")
+          # Keys --apply had no reason to change.
+          [ "$(rewrite_all "$old")" != "$old" ] || continue
+          printf 'URL\t%s\t%s\t%s\t%s\n' "$path" "$repo" "$key" "$key"
+        done
+    else
+      repo=$(git -C "${path%/*}" rev-parse --show-toplevel 2>/dev/null) || repo=${path%/*}
+      printf 'FILE\t%s\t%s\t%s\t\n' "$path" "$repo" "${path#"$repo"/}"
+    fi
+  done < <(find "$WORK/orig" -type f -print0 | LC_ALL=C sort -z)
+}
+
+# undo_url CONFIG ORIGINAL KEY: give KEY in CONFIG its values in ORIGINAL (the
+# backup's copy), if it still has the values --apply gave it.
+undo_url() {
+  local cfg=$1 orig=$2 key=$3 old now v
+  old=$(git config --file "$orig" --get-all "$key")
+  now=$(git config --file "$cfg" --get-all "$key" 2>/dev/null)
+  ACT_NOTE=""
+  if [ -z "$now" ]; then
+    undo_skip "no longer set"; return
+  elif [ "$now" = "$old" ]; then
+    undo_skip "already undone"; return
+  elif [ "$now" != "$(rewrite_all "$old")" ]; then
+    undo_skip "changed since --apply; now $(printf '%s' "$now" | tr '\n' ' ')"
+    N_CHANGED=$((N_CHANGED + 1)); return
+  elif [ "$APPLY" -eq 0 ]; then
+    ACT_STATUS=undo; N_UNDO=$((N_UNDO + 1)); return
+  fi
+  if [ "$(count_lines "$old")" -eq 1 ]; then
+    git config --file "$cfg" "$key" "$old"
+  else
+    git config --file "$cfg" --unset-all "$key" &&
+      while IFS= read -r v; do
+        git config --file "$cfg" --add "$key" "$v" || break
+      done <<< "$old"
+  fi
+  now=$(git config --file "$cfg" --get-all "$key" 2>/dev/null)
+  if [ "$now" = "$old" ]; then
+    ACT_STATUS=ok; N_UNDO=$((N_UNDO + 1))
+  else
+    ACT_STATUS=FAIL; ACT_NOTE="now: $(printf '%s' "$now" | tr '\n' ' ')"
+    N_FAIL=$((N_FAIL + 1))
+  fi
+}
+
+# undo_file FILE ORIGINAL REPO: put back the backup's copy of FILE, if FILE is
+# still exactly what --fix-files made of it.
+undo_file() {
+  local file=$1 orig=$2 repo=$3
+  ACT_NOTE=""
+  if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+    undo_skip "file is gone"; return
+  elif [ ! -f "$file" ] || [ -L "$file" ]; then
+    undo_skip "no longer a plain file"; N_CHANGED=$((N_CHANGED + 1)); return
+  elif cmp -s "$orig" "$file"; then
+    undo_skip "already undone"; return
+  elif ! perl -pe "$PERL_FIX" < "$orig" > "$WORK/fixed" || ! cmp -s "$WORK/fixed" "$file"; then
+    undo_skip "changed since --apply; left alone"; N_CHANGED=$((N_CHANGED + 1)); return
+  elif [ "$APPLY" -eq 0 ]; then
+    ACT_STATUS=undo; N_UNDO=$((N_UNDO + 1)); return
+  fi
+  # Write through the file, as --apply did, so its permissions and inode stay put.
+  if cat "$orig" > "$file" && cmp -s "$orig" "$file"; then
+    ACT_STATUS=ok; N_UNDO=$((N_UNDO + 1))
+    case $EDITED_REPOS in *$'\n'"$repo"$'\n'*) ;; *) EDITED_REPOS="$EDITED_REPOS$repo"$'\n' ;; esac
+  else
+    ACT_STATUS=FAIL; ACT_NOTE="write failed; the file may be cut short"
+    N_FAIL=$((N_FAIL + 1))
+  fi
+}
+
+undo_command() {
+  local cmd
+  cmd="$(shell_path "$0") --undo $(shell_path "$UNDO")"
+  [ "$LOG_DIR_SET" -eq 1 ] && cmd="$cmd --logdir $(shell_path "$LOG_DIR")"
+  printf '%s --apply' "$cmd"
+}
+
+undo_main() {
+  local i=0 kind path key repo what r first=1
+  trap '' PIPE
+
+  separator
+  say "RUN"
+  kv "Tool" "bitbucket-ssh-migrate $VERSION"
+  kv "Started" "$(date '+%Y-%m-%d %H:%M:%S %Z') on $(hostname 2>/dev/null)"
+  kv "Command" "$(tilde "$0") $(printf '%s' "$ORIG_ARGS" | sed "s#$HOME#~#g")"
+  if [ "$APPLY" -eq 1 ]; then
+    kv "Mode" "UNDO: puts back what that --apply run changed"
+  else
+    kv "Mode" "UNDO DRY RUN: nothing will be changed"
+  fi
+  kv "Backup" "$(tilde "$UNDO")"
+  kv "Log" "$(tilde "$LOG")"
+
+  separator
+  say "UNDO"
+  mkdir "$WORK/orig"
+  if ! tar -xzf "$UNDO" -C "$WORK/orig" 2>"$WORK/tar.err"; then
+    kv "FAILED" "can't unpack the backup: $(head -n 1 "$WORK/tar.err")"
+    kv "Changes" "none; nothing was changed"
+    separator
+    return 1
+  fi
+  undo_steps > "$PLAN"
+  TOTAL=$(grep -c '' "$PLAN")
+  if [ "$APPLY" -eq 1 ]; then
+    kv "ok" "was still as --apply left it: put back the backup's copy"
+  else
+    kv "undo" "still as --apply left it: would put back the backup's copy"
+  fi
+  kv "skip" "changed since --apply, already undone, or gone: left alone"
+  if [ "$TOTAL" -eq 0 ]; then
+    say "  Nothing in this backup to undo."
+  fi
+  while IFS=$'\t' read -r kind path repo what key; do
+    r=$(tilde "$repo")
+    [ ${#r} -gt "$RW" ] && RW=${#r}
+  done < "$PLAN"
+  while IFS=$'\t' read -r kind path repo what key <&3; do
+    i=$((i + 1))
+    case $kind in
+      URL)  undo_url "$path" "$WORK/orig$path" "$key";   action_line "$i" url  "$repo" "$what" ;;
+      FILE) undo_file "$path" "$WORK/orig$path" "$repo"; action_line "$i" file "$repo" "$what" ;;
+    esac
+  done 3< "$PLAN"
+
+  separator
+  if [ "$APPLY" -eq 1 ]; then
+    say "RESULT"
+    kv "Undone" "$N_UNDO"
+  else
+    say "DRY RUN: nothing was changed"
+    kv "Would undo" "$N_UNDO"
+  fi
+  [ "$N_SKIP" -gt 0 ] && kv "Left alone" "$N_SKIP (marked skip above)"
+  [ "$N_FAIL" -gt 0 ] && kv "FAILED" "$N_FAIL (marked FAIL above)"
+  if [ "$N_CHANGED" -gt 0 ]; then
+    kv "By hand" "tar -xzOf $(shell_path "$UNDO") PATH"
+    kv "" "prints the backup's copy of /PATH (give PATH without the /)"
+  fi
+  [ "$APPLY" -eq 0 ] && [ "$N_UNDO" -gt 0 ] && kv "To undo" "$(undo_command)"
+  kv "Log" "$(tilde "$LOG")"
+  if [ "$EDITED_REPOS" != $'\n' ]; then
+    while IFS= read -r repo; do
+      [ -n "$repo" ] || continue
+      if [ "$first" -eq 1 ]; then kv "Review" "git -C $(shell_path "$repo") diff"; first=0
+      else kv "" "git -C $(shell_path "$repo") diff"; fi
+    done <<< "$EDITED_REPOS"
+  fi
+  separator
+
+  [ "$N_FAIL" -eq 0 ]
+}
+
 # --- main ---------------------------------------------------------------------
 
 rerun_command() {
@@ -843,7 +1062,7 @@ main() {
     [ "$N_SKIP" -gt 0 ] && kv "Skipped" "$N_SKIP (already updated or gone)"
     [ "$N_FAIL" -gt 0 ] && kv "FAILED" "$N_FAIL (marked FAIL above)"
     kv "Backup" "$(tilde "$BACKUP")"
-    kv "Undo" "tar -xzf $(shell_path "$BACKUP") -C /"
+    kv "Undo" "$(shell_path "$0") --undo $(shell_path "$BACKUP")"
     kv "Log" "$(tilde "$LOG")"
     if [ "$EDITED_REPOS" != $'\n' ]; then
       while IFS= read -r repo; do
@@ -915,5 +1134,6 @@ main() {
 
 # tee ignores SIGPIPE too, so the log stays complete (BSD tee; GNU tee still
 # stops at the first failed write to the terminal side).
-main 2>&1 | (trap '' PIPE; exec tee -a "$LOG")
+run() { if [ -n "$UNDO" ]; then undo_main; else main; fi; }
+run 2>&1 | (trap '' PIPE; exec tee -a "$LOG")
 exit "${PIPESTATUS[0]}"
