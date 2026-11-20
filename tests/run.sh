@@ -32,8 +32,49 @@ commit_all() {
 
 origin_of() { git -C "$1" config remote.origin.url; }
 
+# Every push URL of $1's origin, with the host put back to the old one, on
+# one line: shows which values survived, whichever host each is on now.
+pushurls_of() {
+  git -C "$1" config --get-all remote.origin.pushurl | sed "s/ssh\\.$HOST/$HOST/" | tr '\n' ' '
+}
+
+# A cat that dies partway through writing into a file, as a full disk or a
+# kill would stop it. Use with run_with_fakes.
+install_failing_cat() {
+  mkdir -p "$T/bin"
+  cat > "$T/bin/cat" <<EOF
+#!/bin/sh
+if [ \$# -eq 1 ] && [ -f /dev/stdout ]; then head -c 20 "\$1"; exit 1; fi
+exec $(command -v cat) "\$@"
+EOF
+  chmod +x "$T/bin/cat"
+}
+
+# A git whose config writes fail after the first one: a run stopped between
+# two writes to the same config. Use with run_with_fakes.
+install_failing_git() {
+  mkdir -p "$T/bin"
+  cat > "$T/bin/git" <<EOF
+#!/bin/sh
+case " \$* " in
+  *" config "*)
+    case " \$* " in
+      *" --get"*|*" --list "*|*" -l "*) ;;
+      *) n=\$(cat "$T/git-writes" 2>/dev/null || echo 0)
+         echo \$((n + 1)) > "$T/git-writes"
+         [ "\$n" -lt 1 ] || exit 1 ;;
+    esac ;;
+esac
+exec $(command -v git) "\$@"
+EOF
+  chmod +x "$T/bin/git"
+}
+
 # run_script ARGS...: run the script from $T/cwd, with logs in $T/logs.
 run_script() { (cd "$T/cwd" && "$SCRIPT" --logdir "$T/logs" "$@"); }
+
+# run_with_fakes ARGS...: run_script, with the fake tools in $T/bin first on PATH.
+run_with_fakes() { (cd "$T/cwd" && PATH="$T/bin:$PATH" "$SCRIPT" --logdir "$T/logs" "$@"); }
 
 fail() { printf '      %s\n' "$*"; FAILED=1; }
 
@@ -190,6 +231,66 @@ test_alias_check_sees_a_git_insteadof_rule() {
     fail "check row: $(printf '%s\n' "$out" | grep '| old-host alias')"
 }
 
+# --- writes that fail partway --------------------------------------------------
+# A write cut short (disk full, Ctrl-C) must leave the old contents, not half
+# of the new ones.
+
+test_fix_files_leaves_a_file_whole_when_its_write_fails() {
+  local rc
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  printf "mod 'nfs', :git => '%s:team/nfs.git'\nmod 'stdlib'\nmod 'concat'\n" "$OLD" > "$T/repos/r/Puppetfile"
+  commit_all "$T/repos/r"
+  cp "$T/repos/r/Puppetfile" "$T/original"
+  install_failing_cat
+  run_with_fakes --apply --fix-files "$T/repos" > "$T/out" 2>&1
+  rc=$?
+  cmp -s "$T/original" "$T/repos/r/Puppetfile" ||
+    fail "file now holds $(wc -c < "$T/repos/r/Puppetfile") bytes: $(cat "$T/repos/r/Puppetfile")"
+  [ "$rc" -eq 1 ] || fail "exit code $rc, not 1"
+  grep -q -E '\] +FAIL +file ' "$T/out" || fail "no FAIL line for the file"
+  [ -z "$(git -C "$T/repos/r" status --porcelain)" ] ||
+    fail "repo not clean: $(git -C "$T/repos/r" status --porcelain | tr '\n' ' ')"
+}
+
+# The new contents are written to a temp file and renamed into place; the
+# file's mode must come along, or git sees a mode change.
+test_fix_files_keeps_a_files_permissions() {
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  printf '#!/bin/sh\ngit clone %s:team/x.git\n' "$OLD" > "$T/repos/r/deploy.sh"
+  chmod 755 "$T/repos/r/deploy.sh"
+  commit_all "$T/repos/r"
+  run_script --apply --fix-files "$T/repos" >/dev/null 2>&1
+  [ -x "$T/repos/r/deploy.sh" ] || fail "deploy.sh lost its execute bit"
+  [ -z "$(git -C "$T/repos/r" diff --summary)" ] ||
+    fail "git sees: $(git -C "$T/repos/r" diff --summary)"
+}
+
+# Another git command holding the config's lock: change nothing, say why.
+test_apply_says_why_when_the_config_is_locked() {
+  local out
+  new_repo "$T/repos/r"
+  git -C "$T/repos/r" config --add remote.origin.pushurl "$OLD:team/a.git"
+  git -C "$T/repos/r" config --add remote.origin.pushurl "$OLD:team/b.git"
+  : > "$T/repos/r/.git/config.lock"
+  out=$(run_script --apply "$T/repos" 2>&1)
+  [ "$(git -C "$T/repos/r" config --get-all remote.origin.pushurl | tr '\n' ' ')" = "$OLD:team/a.git $OLD:team/b.git " ] ||
+    fail "pushurl now: $(git -C "$T/repos/r" config --get-all remote.origin.pushurl | tr '\n' ' ')"
+  printf '%s\n' "$out" | grep -E '\] +FAIL +url ' | grep -q 'config.lock' ||
+    fail "FAIL line: $(printf '%s\n' "$out" | grep -E '\] +[a-zA-Z]+ +url ')"
+}
+
+# Several values can't be changed in one git config call; stopped between
+# calls (unset all, then add each back), the URLs were gone.
+test_apply_keeps_every_url_of_a_key_when_a_write_fails() {
+  new_repo "$T/repos/r"
+  git -C "$T/repos/r" config --add remote.origin.pushurl "$OLD:team/a.git"
+  git -C "$T/repos/r" config --add remote.origin.pushurl "$OLD:team/b.git"
+  install_failing_git
+  run_with_fakes --apply "$T/repos" >/dev/null 2>&1
+  [ "$(pushurls_of "$T/repos/r")" = "$OLD:team/a.git $OLD:team/b.git " ] ||
+    fail "pushurl now: $(git -C "$T/repos/r" config --get-all remote.origin.pushurl | tr '\n' ' ')"
+}
+
 # --- undo ---------------------------------------------------------------------
 # Restoring whole files from the backup (tar -xzf ... -C /) also throws away
 # everything changed in them since --apply. --undo reverts only what --apply
@@ -297,6 +398,29 @@ test_undo_handles_a_non_ascii_file_name() {
   run_script --undo "$(backup_file)" --apply >/dev/null 2>&1
   [ "$(cat "$T/repos/r/résumé.md")" = "$OLD:team/x.git" ] ||
     fail "file now holds: $(cat "$T/repos/r/résumé.md")"
+}
+
+test_undo_leaves_a_file_whole_when_its_write_fails() {
+  new_repo "$T/repos/r" "$OLD:team/r.git"
+  printf "mod 'nfs', :git => '%s:team/nfs.git'\nmod 'stdlib'\nmod 'concat'\n" "$OLD" > "$T/repos/r/Puppetfile"
+  commit_all "$T/repos/r"
+  run_script --apply --fix-files "$T/repos" >/dev/null 2>&1
+  cp "$T/repos/r/Puppetfile" "$T/applied"
+  install_failing_cat
+  run_with_fakes --undo "$(backup_file)" --apply >/dev/null 2>&1
+  cmp -s "$T/applied" "$T/repos/r/Puppetfile" ||
+    fail "file now holds $(wc -c < "$T/repos/r/Puppetfile") bytes: $(cat "$T/repos/r/Puppetfile")"
+}
+
+test_undo_keeps_every_url_of_a_key_when_a_write_fails() {
+  new_repo "$T/repos/r"
+  git -C "$T/repos/r" config --add remote.origin.pushurl "$OLD:team/a.git"
+  git -C "$T/repos/r" config --add remote.origin.pushurl "$OLD:team/b.git"
+  run_script --apply "$T/repos" >/dev/null 2>&1
+  install_failing_git
+  run_with_fakes --undo "$(backup_file)" --apply >/dev/null 2>&1
+  [ "$(pushurls_of "$T/repos/r")" = "$OLD:team/a.git $OLD:team/b.git " ] ||
+    fail "pushurl now: $(git -C "$T/repos/r" config --get-all remote.origin.pushurl | tr '\n' ' ')"
 }
 
 # A relative backup path must not be looked up through CDPATH.

@@ -56,7 +56,7 @@
 # and perl for --fix-files. Works on macOS and Linux.
 
 PROG=${0##*/}
-VERSION=1.3.0
+VERSION=1.3.1
 ORIG_ARGS="$*"
 
 DEFAULT_DEPTH=7
@@ -670,10 +670,58 @@ EDITED_REPOS=$'\n'
 ACT_STATUS=""; ACT_NOTE=""
 TOTAL=0; RW=0
 
-# apply_url REPO KEY: rewrite every value of KEY. Sets ACT_STATUS, ACT_NOTE.
+# Every change below is all or nothing: a write that fails or is cut short
+# (disk full, Ctrl-C) leaves the old contents, never part of the new.
+
+# replace_file FILE NEW: give FILE the contents of file NEW. They go into a
+# temp file beside FILE (cp -p first, for FILE's permissions), which is then
+# renamed over FILE. As with sed -i, a hard link to FILE keeps the old text.
+replace_file() {
+  local file=$1 new=$2 tmp ok=0
+  tmp=$(mktemp "${file%/*}/.bbssh-migrate.XXXXXX") || return 1
+  trap 'rm -f "$tmp"; exit 130' INT TERM HUP
+  cp -p "$file" "$tmp" && cat "$new" > "$tmp" && mv -f "$tmp" "$file" && ok=1
+  [ "$ok" -eq 1 ] || rm -f "$tmp"
+  trap - INT TERM HUP
+  [ "$ok" -eq 1 ]
+}
+
+# set_values CONFIG KEY VALUES: make VALUES (one per line, in order) the
+# values of KEY in git config file CONFIG.
+set_values() {
+  local cfg=$1 key=$2 vals=$3 lock="$1.lock" v ok=1
+  if [ "$(count_lines "$vals")" -eq 1 ]; then
+    git config --file "$cfg" "$key" "$vals"   # one call; git makes it atomic
+    return
+  fi
+  # No single git call sets several values, and a run stopped between calls
+  # (unset them all, then add each back) loses URLs. So do what git does
+  # inside each call: hold CONFIG.lock, which keeps other git commands from
+  # writing CONFIG meanwhile, build the new file in it, rename it over CONFIG.
+  ( set -o noclobber; : > "$lock" ) 2>/dev/null || return 1
+  trap 'rm -f "$lock"; exit 130' INT TERM HUP
+  { cp -p "$cfg" "$lock" && git config --file "$lock" --unset-all "$key"; } || ok=0
+  if [ "$ok" -eq 1 ]; then
+    while IFS= read -r v; do
+      git config --file "$lock" --add "$key" "$v" || { ok=0; break; }
+    done <<< "$vals"
+  fi
+  [ "$ok" -eq 1 ] && { mv -f "$lock" "$cfg" || ok=0; }
+  [ "$ok" -eq 1 ] || rm -f "$lock"
+  trap - INT TERM HUP
+  [ "$ok" -eq 1 ]
+}
+
+# url_fail_note CONFIG VALUES: why a URL change failed, and where it stands.
+url_fail_note() {
+  [ -e "$1.lock" ] && printf '%s.lock exists (git is busy, or a crashed git left it); ' "${1##*/}"
+  printf 'now: %s' "$(printf '%s' "$2" | tr '\n' ' ')"
+}
+
+# apply_url CONFIG KEY: rewrite every value of KEY. Sets ACT_STATUS, ACT_NOTE.
 apply_url() {
-  local repo=$1 key=$2 vals count changed=0 v expected now
-  vals=$(git -C "$repo" config --local --get-all "$key" 2>/dev/null)
+  local cfg=$1 key=$2 vals count changed=0 v expected now
+  vals=$(git config --file "$cfg" --get-all "$key" 2>/dev/null)
   count=$(count_lines "$vals")
   expected=$(while IFS= read -r v; do rewrite_url "$v"; done <<< "$vals")
   while IFS= read -r v; do
@@ -686,23 +734,16 @@ apply_url() {
   if [ "$changed" -eq 0 ]; then
     ACT_STATUS=skip; ACT_NOTE="already updated"; N_SKIP=$((N_SKIP + 1)); return
   fi
-  if [ "$count" -eq 1 ]; then
-    git -C "$repo" config --local "$key" "$expected"
-  else
-    # Several values (e.g. push to more than one URL): rewrite all, keep order.
-    git -C "$repo" config --local --unset-all "$key" &&
-      while IFS= read -r v; do
-        git -C "$repo" config --local --add "$key" "$v" || break
-      done <<< "$expected"
-    ACT_NOTE="$changed of $count values"
-  fi
-  now=$(git -C "$repo" config --local --get-all "$key" 2>/dev/null)
+  # Several values (e.g. push to more than one URL): rewrite all, keep order.
+  set_values "$cfg" "$key" "$expected"
+  [ "$count" -eq 1 ] || ACT_NOTE="$changed of $count values"
+  now=$(git config --file "$cfg" --get-all "$key" 2>/dev/null)
   if [ "$now" = "$expected" ]; then
     ACT_STATUS=ok
     N_URL_DONE=$((N_URL_DONE + changed))
   else
     ACT_STATUS=FAIL
-    ACT_NOTE="now: $(printf '%s' "$now" | tr '\n' ' ')"
+    ACT_NOTE=$(url_fail_note "$cfg" "$now")
     N_FAIL=$((N_FAIL + 1))
   fi
 }
@@ -720,8 +761,7 @@ apply_file() {
   fi
   # The file goes in on stdin: given as an argument, perl's 2-arg open would
   # run a name ending in "|" as a command and strip trailing spaces from it.
-  # Write through the original file so its permissions and inode stay put.
-  if perl -pe "$PERL_FIX" < "$abs" > "$WORK/fix.tmp" && cat "$WORK/fix.tmp" > "$abs"; then
+  if perl -pe "$PERL_FIX" < "$abs" > "$WORK/fix.tmp" && replace_file "$abs" "$WORK/fix.tmp"; then
     after=$(grep -c -E "$GREP_RE" "$abs" 2>/dev/null); after=${after:-0}
     case $EDITED_REPOS in *$'\n'"$repo"$'\n'*) ;; *) EDITED_REPOS="$EDITED_REPOS$repo"$'\n' ;; esac
     if [ "$after" -eq 0 ]; then
@@ -732,7 +772,7 @@ apply_file() {
       N_FAIL=$((N_FAIL + 1))
     fi
   else
-    ACT_STATUS=FAIL; ACT_NOTE="couldn't write the file"
+    ACT_STATUS=FAIL; ACT_NOTE="couldn't write it; the file is unchanged"
     N_FAIL=$((N_FAIL + 1))
   fi
 }
@@ -774,7 +814,7 @@ backup_and_apply() {
   while IFS=$'\t' read -r kind repo path key <&3; do
     i=$((i + 1))
     case $kind in
-      URL)  apply_url "$repo" "$key";   action_line "$i" url  "$repo" "$key" ;;
+      URL)  apply_url "$path" "$key";   action_line "$i" url  "$repo" "$key" ;;
       FILE) apply_file "$repo" "$path"; action_line "$i" file "$repo" "$key" ;;
     esac
   done 3< "$PLAN"
@@ -845,19 +885,12 @@ undo_url() {
   elif [ "$APPLY" -eq 0 ]; then
     ACT_STATUS=undo; N_UNDO=$((N_UNDO + 1)); return
   fi
-  if [ "$(count_lines "$old")" -eq 1 ]; then
-    git config --file "$cfg" "$key" "$old"
-  else
-    git config --file "$cfg" --unset-all "$key" &&
-      while IFS= read -r v; do
-        git config --file "$cfg" --add "$key" "$v" || break
-      done <<< "$old"
-  fi
+  set_values "$cfg" "$key" "$old"
   now=$(git config --file "$cfg" --get-all "$key" 2>/dev/null)
   if [ "$now" = "$old" ]; then
     ACT_STATUS=ok; N_UNDO=$((N_UNDO + 1))
   else
-    ACT_STATUS=FAIL; ACT_NOTE="now: $(printf '%s' "$now" | tr '\n' ' ')"
+    ACT_STATUS=FAIL; ACT_NOTE=$(url_fail_note "$cfg" "$now")
     N_FAIL=$((N_FAIL + 1))
   fi
 }
@@ -878,12 +911,11 @@ undo_file() {
   elif [ "$APPLY" -eq 0 ]; then
     ACT_STATUS=undo; N_UNDO=$((N_UNDO + 1)); return
   fi
-  # Write through the file, as --apply did, so its permissions and inode stay put.
-  if cat "$orig" > "$file" && cmp -s "$orig" "$file"; then
+  if replace_file "$file" "$orig" && cmp -s "$orig" "$file"; then
     ACT_STATUS=ok; N_UNDO=$((N_UNDO + 1))
     case $EDITED_REPOS in *$'\n'"$repo"$'\n'*) ;; *) EDITED_REPOS="$EDITED_REPOS$repo"$'\n' ;; esac
   else
-    ACT_STATUS=FAIL; ACT_NOTE="write failed; the file may be cut short"
+    ACT_STATUS=FAIL; ACT_NOTE="couldn't write it; the file is unchanged"
     N_FAIL=$((N_FAIL + 1))
   fi
 }

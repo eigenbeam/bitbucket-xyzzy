@@ -251,6 +251,12 @@ RESULT
 It never edits your SSH config or global git config. When something there
 needs attention, it prints the exact fix.
 
+Each change is all or nothing. A file gets its new contents in a temp file
+beside it (with the same permissions), which is then renamed over it, so a
+full disk or a Ctrl-C leaves the old file, not half of the new one. A hard
+link to the file keeps the old contents, as with `sed -i`. A remote with
+several URLs gets them all in one write, under git's own `config.lock`.
+
 Only the host changes. URL forms it handles:
 
 | Before                                    | After                                         |
@@ -392,8 +398,9 @@ them, and checks the repos and files afterwards. They cover hostile file
 names under `--fix-files`, a scanned repo's `core.fsmonitor`, output piped
 into `head`, non-ASCII file names, an exported `CDPATH` or `GIT_DIR`, and
 what `--fix-files` rewrites (every line shown in the dry run, repos hosted
-elsewhere, never this tool's own repo or script), and what `--undo` puts
-back and what it leaves alone.
+elsewhere, never this tool's own repo or script), what `--undo` puts back
+and what it leaves alone, and writes that fail partway (they must leave the
+old contents).
 
 ## Disclaimer
 
